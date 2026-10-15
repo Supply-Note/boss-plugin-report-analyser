@@ -1,0 +1,192 @@
+---
+name: tool-creator
+description: Build the Report analyser BOSS plugin in this repo following house conventions
+---
+
+# Tool Creator — build the Report analyser BOSS plugin
+
+You are working in a freshly scaffolded **BOSS dynamic plugin** repository. The
+skeleton already compiles: build files, `plugin.json` manifest, entry class,
+panel UI, and release CI are in place. Your job is to implement the tool's
+actual behavior.
+
+## The tool to build
+
+- **Name**: Report analyser
+- **Plugin id**: `ai.rever.boss.plugin.dynamic.reportanalyser`
+- **What it should do**: Fetch & download reports & summarise
+- **Granted permissions**:
+- `files.read` — Read files and directories in the user workspace
+- `network.access` — Make outbound HTTP or socket connections
+- `mcp.tools` — Offer tools to AI agents via the boss MCP server
+- `browser.control` — Open and drive browser tabs in BOSS
+- `secrets.read` — Access the BOSS secret manager
+
+Stay within the granted permissions: do not add capabilities (shelling out,
+network calls, secret access…) the user did not grant.
+
+## BOSS plugin ground rules
+
+1. **API dependency**: `boss-plugin-api` is `compileOnly` — the host classloader
+   provides it at runtime. Never bundle or shade it into the plugin jar.
+2. **Entry point**: `ReportAnalyserDynamicPlugin` implements
+   `ai.rever.boss.plugin.api.DynamicPlugin`. All registration happens in
+   `register(context: PluginContext)`, cleanup in `dispose()`.
+3. **UI**: Compose Multiplatform desktop APIs only (never Android). The sidebar
+   panel is `ReportAnalyserComponent : PanelComponentWithUI` with
+   `@Composable fun Content()`. Wrap UI in `BossTheme { }` and use
+   `ai.rever.boss.plugin.ui.BossThemeColors` tokens for styling.
+4. **State**: plain ViewModel class + `kotlinx.coroutines.flow.StateFlow`,
+   collected with `collectAsState()` in composables.
+5. **Null-safety**: every provider on `PluginContext` may be **null**
+   (`workspaceDataProvider`, `splitViewOperations`, `activeTabsProvider`,
+   `notificationProvider`, `genericDialogProvider`, `gitDataProvider`,
+   `secretDataProvider`, `fileSystemDataProvider`, `browserService`, …).
+   Degrade gracefully, never crash. Prefer host providers over raw
+   `ProcessBuilder`/`java.io` when one exists.
+6. **Version**: `build.gradle.kts` `version` is the single source of truth;
+   `processResources` syncs it into `plugin.json`. Never hand-edit the version
+   in `plugin.json`, and do NOT bump the version while iterating locally —
+   keep overwriting the same jar; CI bumps on release.
+7. **Style**: every Kotlin file ends with a newline. Match the skeleton's code
+   style.
+
+## Exposing the tool as an MCP tool (AI-agent callable)
+
+If the tool's function should be callable by AI agents (and the `mcp.tools`
+permission was granted), expose it through the boss MCP server. Tools registered
+this way appear to agents as `mcp__boss__<tool_name>` while the plugin is loaded
+and disappear when it unloads.
+
+Implement `McpToolProvider` (all types in `ai.rever.boss.plugin.api`):
+
+```kotlin
+class ReportAnalyserMcpToolProvider(
+    override val providerId: String,          // convention: the pluginId
+    private val viewModel: ReportAnalyserViewModel,
+) : McpToolProvider {
+    override fun tools(): List<McpToolDefinition> = listOf(
+        McpToolDefinition(
+            name = "reportanalyser_run",         // snake_case, verb-like
+            description = "One-line description agents will read",
+            inputSchema = """
+                {
+                  "type": "object",
+                  "properties": {
+                    "query": {"type": "string", "description": "What to run"}
+                  },
+                  "required": ["query"]
+                }
+            """.trimIndent(),
+            readOnly = true,                  // false if the tool mutates state
+            handler = { args ->
+                val query = args.string("query")
+                    ?: return@McpToolDefinition McpToolResult("Missing query", isError = true)
+                McpToolResult(viewModel.runForAgent(query))
+            },
+        )
+    )
+}
+```
+
+Register it in `register(context)` and the host auto-unregisters on unload:
+
+```kotlin
+context.registerMcpToolProvider(ReportAnalyserMcpToolProvider(pluginId, viewModel))
+```
+
+MCP rules of thumb:
+- `McpToolHandler.call` is `suspend` — keep it cancellation-cooperative, no
+  blocking sleeps; wrap blocking IO in `withContext(Dispatchers.IO)`.
+- `McpToolArgs` accessors: `string(key)`, `boolean(key)`, `int(key)`,
+  `double(key)`, `has(key)`; raw JSON in `args.raw`.
+- Return `McpToolResult(text, isError = true)` for failures instead of throwing.
+- `tools()` is snapshotted at (re)registration — it is not reactive.
+- For permission-gated tools use
+  `McpToolDefinition.withRbac(name, description, handler, requiredPermissions = listOf(...), requiresAdmin = false)`.
+
+## Useful PluginContext surface
+
+- `context.panelRegistry.registerPanel(info) { ctx, panelInfo -> Component(...) }` — already wired.
+- `context.notificationProvider?.showToast(message, type, title = …)` — toasts.
+- `context.genericDialogProvider` — host-styled dialogs (`showTextInputDialog`,
+  `showConfirmationDialog`, `showChoiceDialog`, `showProgressDialog`, all suspend).
+- `context.splitViewOperations?.openTab(tabInfo)` — open tabs (e.g.
+  `ai.rever.boss.plugin.tab.terminal.TerminalTabInfo` for a terminal running a
+  command in a working directory).
+- `context.getPluginAPI(SomePluginAPI::class.java)` — consume other plugins'
+  APIs (e.g. `TerminalTabPluginAPI` for terminal control).
+- `context.pluginScope` — lifecycle-scoped `CoroutineScope`.
+
+## Extending host UI (api ≥ 1.0.62, host ≥ the platform release)
+
+All hooks below are default no-ops on older hosts (degrade gracefully) and are
+auto-unregistered when the plugin unloads. All types live in
+`ai.rever.boss.plugin.api`.
+
+- **Panel top-bar menu items** — add entries to the "…"/right-click menu of
+  YOUR panel, ANOTHER plugin's panel (by its panel-id string), or ALL panels:
+  `context.registerPanelMenuContribution(object : PanelMenuContribution {
+      override val contributionId = "ai.rever.boss.plugin.dynamic.reportanalyser:main"
+      override val targetPanels = null              // null = ALL panels
+      override fun items(panelId: PanelId) = listOf(PanelMenuItem(id = "sync", label = "Sync now"))
+      override fun onItemClick(panelId: PanelId, itemId: String, windowId: String?) { /* route */ }
+  })` — `items()` may run on every top-bar recomposition: keep it cheap and
+  side-effect free; re-register to change the item set.
+- **New Tab dialog entry** — give your registered tab type
+  `override val newTabSpec = NewTabSpec(inputLabel = "…")` and
+  `override fun createTabInfo(input: String, context: NewTabContext): TabInfo?`
+  (return null to reject input; dialog stays open).
+- **Settings page** — `context.registerSettingsPage(provider)` with
+  `SettingsPageProvider { pageId = "ai.rever.boss.plugin.dynamic.reportanalyser:settings"; … @Composable Content() }`.
+  Set `selfScrolling = true` if Content uses LazyColumn or its own scroll
+  (otherwise the host wraps it in a vertical scroll and a nested fill-height
+  scrollable crashes with "unbounded height").
+- **Deep-link actions** — `context.registerDeepLinkActionHandler(handler)`;
+  `boss://plugin?id=<handlerId>&action=<action>&<args…>` then calls
+  `handle(action, params)`. External input: validate every parameter.
+- **Global shortcuts** — `context.registerShortcutActionProvider(provider)`
+  with `PluginShortcutSpec(actionId = "plugin.ai.rever.boss.plugin.dynamic.reportanalyser.<name>", …)`.
+  Default chords MUST include Cmd/Ctrl/Alt (bare or Shift-only chords are
+  unreachable and register unbound); users can rebind in Settings → Shortcuts.
+- **Status-bar widget** — `context.registerStatusBarItem(provider)`; keep
+  Content a small single-row composable. A crash collapses the widget to an
+  error marker (plugin extension boundary), not the whole bar.
+
+### Version gates — which manifest field to bump
+
+- Uses only **brand-new API types** (shipped by the boss-plugin-api jar alone,
+  e.g. a new plugin-to-plugin interface)? → set `minApiVersion` in
+  `plugin.json` to the SDK version that introduced them.
+- Depends on a **host-rendered capability** (the registries above, a new
+  provider)? → set `minBossVersion` to the host release that renders it.
+- Feature-detect at runtime with
+  `BossApiRuntime.isAtLeast("1.0.62")` instead of crashing on older setups.
+
+## Build & test loop
+
+```bash
+./gradlew buildPluginJar          # output: build/libs/boss-plugin-report-analyser-<version>.jar
+cp build/libs/boss-plugin-report-analyser-*.jar ~/.boss/plugins/
+```
+
+Developers running a dev-mode BOSS use `~/.boss_debug/plugins` instead. Reload
+plugins in BOSS (Toolbox) or restart the app to pick up the new jar.
+
+## Release
+
+Pushing to `main` triggers `.github/workflows/build.yml`, which delegates to the
+shared release workflow: bumps the version with a `[skip ci]` commit, builds the
+jar, creates a GitHub release, and publishes to the BOSS Plugin Store (needs the
+`BOSS_STORE_PLUGIN_PUBLISH_KEY` repo secret). Never re-run a failed release run
+from the Actions UI — dispatch a fresh run instead.
+
+## What to do now
+
+1. Read `plugin.json`, `build.gradle.kts`, and the skeleton sources under
+   `src/main/kotlin/ai/rever/boss/plugin/dynamic/reportanalyser/`.
+2. Plan the implementation of: Fetch & download reports & summarise
+3. Implement it following the ground rules — panel UI first, then the MCP tool
+   surface if `mcp.tools` was granted.
+4. Run `./gradlew buildPluginJar` and fix until it builds clean.
+5. Summarize what you built and how to test it inside BOSS.

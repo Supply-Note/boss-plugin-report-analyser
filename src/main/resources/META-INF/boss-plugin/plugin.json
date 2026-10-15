@@ -1,0 +1,18 @@
+{
+  "manifestVersion": 1,
+  "pluginId": "ai.rever.boss.plugin.dynamic.reportanalyser",
+  "displayName": "Report analyser",
+  "version": "0.1.0",
+  "apiVersion": "1.0.62",
+  "minApiVersion": "1.0.62",
+  "minBossVersion": "9.2.20",
+  "mainClass": "ai.rever.boss.plugin.dynamic.reportanalyser.ReportAnalyserDynamicPlugin",
+  "type": "panel",
+  "description": "Fetch & download reports & summarise",
+  "author": "Risa Labs",
+  "url": "https://github.com/risa-labs-inc/boss-plugin-report-analyser",
+  "panel": {
+    "position": "left_bottom",
+    "priority": 50
+  }
+}
